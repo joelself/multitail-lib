@@ -214,9 +214,12 @@ fn open_and_seek<'a>(filepath: &str, buf: &'a mut [u8;2048]) -> (File, &'a [u8])
 	file.seek(SeekFrom::End(-(size as i64))).unwrap();
 	file.read_to_end(&mut bytes);
 	for i in 0..bytes.len() - 1 {
-		if bytes[size as usize -1 - i] == 0x0A && nls == 1 {
-			// Found the second newline, don't include it in the returned slice
-			return (file, &buf[..i]);
+		if bytes[size as usize -1 - i] == 0x0A {
+			nls += 1;
+			if nls == 2 {
+				// Found the second newline, don't include it in the returned slice
+				return (file, &buf[..i]);
+			}
 		}
 		buf[i] = bytes[i];
 	}
