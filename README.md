@@ -1,7 +1,8 @@
 # multitail
 A multi-platform file tailer that uses colors to differentiate different files. Multitail defaults to following files.
 
-####Note, doesn't actually work yet.
+####Actually works now.
+It needs to put in a newline when it context switches between threads, but otherwise it works correctly.
 
 Usage: `mtail FILE [FILE]*`
 
@@ -17,11 +18,11 @@ mtail [OPTIONS] FILE BACKGROUND_COLOR:FOREGROUND_COLOR:[ATTRIBUTE] [FILE BACKGRO
 ```
 Things to do:
 - [ ] Add license file
-- [ ] Implement finding the last newline
+- [x] Implement finding the last newline
 - [ ] Actually handle errors
-- [ ] Seek to end when opening a file
+- [x] Seek to end when opening a file
 - [ ] Write unit tests
-- [ ] Join all handles and exit?
+- [x] Join all handles and exit?
 - [ ] Implement a multifile writer for integration tests
 - [ ] Write integration tests
 - [ ] Read commands while running
