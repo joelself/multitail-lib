@@ -3,8 +3,8 @@ extern crate libc;
 #[cfg(target_os = "macos")]
 extern crate fsevent;
 use std::boxed::Box;
-use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::{Arc, Mutex, mpsc};
 use std::{thread, env, str};
 use std::thread::JoinHandle;
 use std::fs;
@@ -12,7 +12,8 @@ use std::fs::File;
 use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::ffi::CStr;
-use libc::c_char;
+use libc::{c_char, size_t};
+use std::cell::RefCell;
 use notify::{RecommendedWatcher, PollWatcher, Error, Watcher, op};
 use self::macros::*;
 #[macro_use]
@@ -21,83 +22,92 @@ mod macros;
 const TX_BUF_SIZE: usize = 1024usize;
 
 #[no_mangle]
-pub extern "C" fn start_all_talis(array_file_path: **const c_char, size_t length) -> Box<MultiTail> {
+pub extern "C" fn start_all_talis(array_file_path: *const *const c_char, length: size_t) -> Box<MultiTail> {
 	let files = vec![];
 	for i in 0..length {
-		let array &[u8] = unsafe {
-			std::slice::from_raw_parts(array_pointer as *const u8, size as usize) 
-		}
-		files.push(String::from_utf8(sparkle_heart).unwrap());
+		let array: &[u8] = unsafe {
+			std::slice::from_raw_parts(array_file_path as *const u8, length as usize)
+		};
+		files.push(str::from_utf8(array).unwrap().to_string());
 	}
 	start_all_tails_internal(files)
 }
-fn pub start_all_tails_internal(files: Vec<String>) -> Box<MultiTail> {
-	let mtail = MultiTail::new(files);
+pub fn start_all_tails_internal(files: Vec<String>) -> Box<MultiTail> {
+	Box::new(MultiTail::new(files))
 }
 
-struct MultiTail {
-	handles: RefCell<vec<JoinHandle<()>>>;
-	files: Vec<String> files;
-
+pub struct MultiTail {
+	handles: RefCell<Vec<JoinHandle<()>>>,
+	files: Vec<String>,
+	global_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-struct TailBytes {
-	thread: usize;
-	bytes: &[u8];
-	last_nl: isize;
+struct TailBytes<'a> {
+	thread: usize,
+	bytes: &'a [u8],
+	last_nl: isize,
 }
 
 impl MultiTail {
 	pub fn new(files: Vec<String>) -> MultiTail {
-		let res = MultiTail{handles: vec![], files: files.clone()};
-		let (tx, rx) = channel<TailBytes>();
-		let thread_buffers = Vec<Vec<u8>> = vec![];
-		let global_buffer = Vec<u8> = vec![];
+		let (tx, rx) : (Sender<TailBytes>, Receiver<TailBytes>) = mpsc::channel();
+		let thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+		let global_buffer: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+		let receiver = MultiTail{handles: RefCell::new(vec![]), files: files.clone(),
+			global_buffer: global_buffer.clone()};
 		let thread_num = 0;
-		for filepath in matches.iter() {
+		for filepath in files.iter() {
 			let filepath = filepath.clone();
-			res.handles.borrow_mut().push(thread::spawn(move || {
+			receiver.handles.borrow_mut().push(thread::spawn(move || {
 				start_tail(thread_num, filepath, tx.clone());
 			}));
-			buffers.push(vec![]);
+			let thread_buffers = thread_buffers.lock().unwrap();
+			thread_buffers.push(vec![]);
 			thread_num += 1;
 		}
 
+		thread::spawn(move || {
+			MultiTail::receive_msgs(rx, thread_buffers.clone(), global_buffer.clone());
+		});
+		return MultiTail{handles: RefCell::new(vec![]), files: files.clone(), global_buffer: global_buffer.clone()}
+	}
+
+	fn receive_msgs(rx: Receiver<TailBytes>, thread_buffers: Arc<Mutex<Vec<Vec<u8>>>>,
+									global_buffer: Arc<Mutex<Vec<Vec<u8>>>>,) {
 		loop {
 			match rx.recv() {
 				Ok(bytes) => {
-					if(bytes.last_nl >= 0) {
+					if bytes.last_nl >= 0 {
+						// got a printable message
 						// lock thread buffers
-						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes[..bytes.last_nl]);
+						let thread_buffers = thread_buffers.lock().unwrap();
+						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes[..bytes.last_nl as usize]);
 						// lock global buffer
+						let global_buffer = global_buffer.lock().unwrap();
 						global_buffer.push(thread_buffers.remove(bytes.thread));
-						thread_buffers.insert(bytes.thread, vec![]
-							.extend_from_size(&bytes.bytes[bytes.last_nl..]));
+						let new_vec: Vec<u8> = vec![];
+						new_vec.extend_from_slice(&bytes.bytes[bytes.last_nl as usize..]);
+						thread_buffers.insert(bytes.thread, new_vec);
 					} else {
+						// got a an unprintable message, append it to the current buffer
 						// lock thread buffers
+						let thread_buffers = thread_buffers.lock().unwrap();
 						thread_buffers[bytes.thread].extend_from_slice(bytes.bytes);
 					}
 				},
 				_ => (),
 			}
 		}
-
-		while handles.len() > 0 {
-			let handle = handles.pop();
-			if let Some(h) = handle {
-				h.join();
-			}
-		}
 	}
 }
 
-fn open_and_seek<'a>(filepath: &str, buf: &'a mut [u8;2048]) -> (File, &'a [u8]) {
+
+fn open_and_seek<'a>(filepath: &str, buf: &'a mut [u8;TX_BUF_SIZE]) -> (File, &'a [u8]) {
 	// Output up to the last 2 newlines or 2048 bytes, whichever is less
-	const GET_BYTES: u64 = 2048u64;
 	let mut file = File::open(filepath).unwrap();
 	let mut size: u64 = fs::metadata(filepath).unwrap().len();
-	if size > GET_BYTES {
-		size = GET_BYTES;
+	if size > TX_BUF_SIZE as u64 {
+		size = TX_BUF_SIZE as u64;
 	}
 	let mut bytes: Vec<u8> = vec![];
 	let nls = 0;
@@ -149,13 +159,13 @@ fn find_last_nl_slice(buf: &[u8]) -> isize {
 
 
 
-struct Channel {
+struct Channel<'a> {
 	join_handle: Option<JoinHandle<()>>,
 	watcher: Option<RecommendedWatcher>,
-	tx: Sender<notify::Event>,
+	tx: Sender<TailBytes<'a>>,
 }
 
-impl Channel {
+impl<'a> Channel<'a> {
 	#[cfg(target_os = "macos")]
 	pub fn new(tx: Sender<fsevent::Event>, filepath: String, tx_parent: Sender<TailBytes>)
 	-> Channel {
@@ -194,11 +204,10 @@ impl Channel {
 fn start_tail(thread: usize, filepath: String, tx_parent: Sender<TailBytes>) {
 	// Currently the notify library for Rust doesn't work with MacOS X FSEvents on Rust 1.6.0,
 	// and MacOS 10.10.5, so there's two different config methods for setting up a channel
-	let (tx, rx) = channel();	
+	let (tx, rx) = channel();
 	let channel = Channel::new(tx, filepath.clone(), tx_parent);
 	let mut buf: [u8;TX_BUF_SIZE] = [0; TX_BUF_SIZE];
 	let (mut file, buf_slice) = open_and_seek(&filepath, &mut buf);
-	lock_wr_fl!(console: fg_color: bg_color, "\n{}", str::from_utf8(buf_slice).unwrap());
 	loop {
 		match rx.recv() {
 			Ok(event) => {
@@ -216,12 +225,11 @@ fn start_tail(thread: usize, filepath: String, tx_parent: Sender<TailBytes>) {
 					// console.attr(attr);
 					// TODO: actually handle the result
 					// Seek back to just after the last nl
+					let last_nl = find_last_nl(&buf);
 					file.seek(SeekFrom::Current(last_nl as i64 - buf.len() as i64 - 1)).unwrap();
-					}
 				}
 			},
 			_ => (),
 		}
 	}
 }
-

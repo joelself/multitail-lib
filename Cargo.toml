@@ -10,4 +10,4 @@ notify = "^2.5.4"
 fsevent = "^0.2.12"
 
 [[bin]]
-mtaillibtest
+name = "mtaillibtest"
