@@ -23,7 +23,7 @@ const TX_BUF_SIZE: usize = 1024usize;
 
 #[no_mangle]
 pub extern "C" fn start_all_talis(array_file_path: *const *const c_char, length: size_t) -> Box<MultiTail> {
-	let files = vec![];
+	let mut files = vec![];
 	for i in 0..length {
 		let array: &[u8] = unsafe {
 			std::slice::from_raw_parts(array_file_path as *const u8, length as usize)
@@ -42,32 +42,33 @@ pub struct MultiTail {
 	global_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-struct TailBytes<'a> {
+struct TailBytes {
 	thread: usize,
-	bytes: &'a [u8],
+	bytes: RefCell<Vec<u8>>,
 	last_nl: isize,
 }
 
 impl MultiTail {
 	pub fn new(files: Vec<String>) -> MultiTail {
 		let (tx, rx) : (Sender<TailBytes>, Receiver<TailBytes>) = mpsc::channel();
-		let thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
-		let global_buffer: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+		let mut thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+		let mut global_buffer: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
 		let receiver = MultiTail{handles: RefCell::new(vec![]), files: files.clone(),
 			global_buffer: global_buffer.clone()};
-		let thread_num = 0;
+		let mut thread_num = 0;
 		for filepath in files.iter() {
 			let filepath = filepath.clone();
+			let tx_new = tx.clone();
 			receiver.handles.borrow_mut().push(thread::spawn(move || {
-				start_tail(thread_num, filepath, tx.clone());
+				start_tail(thread_num, filepath, tx_new);
 			}));
-			let thread_buffers = thread_buffers.lock().unwrap();
+			let mut thread_buffers = thread_buffers.lock().unwrap();
 			thread_buffers.push(vec![]);
 			thread_num += 1;
 		}
-
+		let global_buf_ref = global_buffer.clone();
 		thread::spawn(move || {
-			MultiTail::receive_msgs(rx, thread_buffers.clone(), global_buffer.clone());
+			MultiTail::receive_msgs(rx, thread_buffers.clone(), global_buf_ref);
 		});
 		return MultiTail{handles: RefCell::new(vec![]), files: files.clone(), global_buffer: global_buffer.clone()}
 	}
@@ -80,19 +81,19 @@ impl MultiTail {
 					if bytes.last_nl >= 0 {
 						// got a printable message
 						// lock thread buffers
-						let thread_buffers = thread_buffers.lock().unwrap();
-						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes[..bytes.last_nl as usize]);
+						let mut thread_buffers = thread_buffers.lock().unwrap();
+						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes.borrow()[..bytes.last_nl as usize]);
 						// lock global buffer
-						let global_buffer = global_buffer.lock().unwrap();
+						let mut global_buffer = global_buffer.lock().unwrap();
 						global_buffer.push(thread_buffers.remove(bytes.thread));
-						let new_vec: Vec<u8> = vec![];
-						new_vec.extend_from_slice(&bytes.bytes[bytes.last_nl as usize..]);
+						let mut new_vec: Vec<u8> = vec![];
+						new_vec.extend_from_slice(&bytes.bytes.borrow()[bytes.last_nl as usize..]);
 						thread_buffers.insert(bytes.thread, new_vec);
 					} else {
 						// got a an unprintable message, append it to the current buffer
 						// lock thread buffers
-						let thread_buffers = thread_buffers.lock().unwrap();
-						thread_buffers[bytes.thread].extend_from_slice(bytes.bytes);
+						let mut thread_buffers = thread_buffers.lock().unwrap();
+						thread_buffers[bytes.thread].append(& mut *bytes.bytes.borrow_mut());
 					}
 				},
 				_ => (),
@@ -102,7 +103,7 @@ impl MultiTail {
 }
 
 
-fn open_and_seek<'a>(filepath: &str, buf: &'a mut [u8;TX_BUF_SIZE]) -> (File, &'a [u8]) {
+fn open_and_seek<'a>(filepath: &str) -> File {
 	// Output up to the last 2 newlines or 2048 bytes, whichever is less
 	let mut file = File::open(filepath).unwrap();
 	let mut size: u64 = fs::metadata(filepath).unwrap().len();
@@ -110,7 +111,7 @@ fn open_and_seek<'a>(filepath: &str, buf: &'a mut [u8;TX_BUF_SIZE]) -> (File, &'
 		size = TX_BUF_SIZE as u64;
 	}
 	let mut bytes: Vec<u8> = vec![];
-	let nls = 0;
+	let mut nls = 0;
 	file.seek(SeekFrom::End(-(size as i64))).unwrap();
 	file.read_to_end(&mut bytes);
 	for i in 0..bytes.len() - 1 {
@@ -118,13 +119,12 @@ fn open_and_seek<'a>(filepath: &str, buf: &'a mut [u8;TX_BUF_SIZE]) -> (File, &'
 			nls += 1;
 			if nls == 2 {
 				// Found the second newline, don't include it in the returned slice
-				return (file, &buf[..i]);
+				return file;
 			}
 		}
-		buf[i] = bytes[i];
 	}
-	// Didn't find 2 newlines, just return 2048 bytes of data
-	return (file, &buf[..]);
+	// Didn't find 2 newlines, just return TX_BUF_SIZE bytes from the end of the file
+	return file;
 }
 
 fn find_last_nl(buf: &Vec<u8>) -> usize {
@@ -159,13 +159,13 @@ fn find_last_nl_slice(buf: &[u8]) -> isize {
 
 
 
-struct Channel<'a> {
+struct Channel {
 	join_handle: Option<JoinHandle<()>>,
 	watcher: Option<RecommendedWatcher>,
-	tx: Sender<TailBytes<'a>>,
+	tx: Sender<TailBytes>,
 }
 
-impl<'a> Channel<'a> {
+impl Channel {
 	#[cfg(target_os = "macos")]
 	pub fn new(tx: Sender<fsevent::Event>, filepath: String, tx_parent: Sender<TailBytes>)
 	-> Channel {
@@ -201,32 +201,32 @@ impl<'a> Channel<'a> {
 	}
 }
 
-fn start_tail(thread: usize, filepath: String, tx_parent: Sender<TailBytes>) {
+fn start_tail<'b>(thread: usize, filepath: String, tx_parent: Sender<TailBytes>) {
+	let mut buffer: Vec<u8> = vec![];
 	// Currently the notify library for Rust doesn't work with MacOS X FSEvents on Rust 1.6.0,
 	// and MacOS 10.10.5, so there's two different config methods for setting up a channel
 	let (tx, rx) = channel();
 	let channel = Channel::new(tx, filepath.clone(), tx_parent);
-	let mut buf: [u8;TX_BUF_SIZE] = [0; TX_BUF_SIZE];
-	let (mut file, buf_slice) = open_and_seek(&filepath, &mut buf);
+	let mut file = open_and_seek(&filepath);
 	loop {
+		buffer.clear();
 		match rx.recv() {
 			Ok(event) => {
 				if event.op.unwrap() == op::WRITE {
-					let mut buf: Vec<u8> = vec![];
-					let bytes_read: usize = 1;
+					let mut bytes_read: usize = 1;
 					// Read to eof
-					bytes_read = file.read_to_end(& mut buf).unwrap();
+					bytes_read = file.read_to_end(& mut buffer).unwrap();
 					// Get index of last newline
 					let pos = 0;
-					for chunk in buf.chunks(TX_BUF_SIZE) {
+					for chunk in buffer.chunks(TX_BUF_SIZE) {
 						let last_nl = find_last_nl_slice(chunk);
-						channel.tx.send(TailBytes{thread: thread, bytes: chunk, last_nl: last_nl}).unwrap();
+						channel.tx.send(TailBytes{thread: thread, bytes: RefCell::new(chunk.to_vec()), last_nl: last_nl}).unwrap();
 					}
 					// console.attr(attr);
 					// TODO: actually handle the result
 					// Seek back to just after the last nl
-					let last_nl = find_last_nl(&buf);
-					file.seek(SeekFrom::Current(last_nl as i64 - buf.len() as i64 - 1)).unwrap();
+					let last_nl = find_last_nl(&buffer);
+					file.seek(SeekFrom::Current(last_nl as i64 - buffer.len() as i64 - 1)).unwrap();
 				}
 			},
 			_ => (),

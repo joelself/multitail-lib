@@ -5,6 +5,7 @@ authors = ["Joel Self <joel@dislocal.com>"]
 
 [dependencies]
 notify = "^2.5.4"
+libc = "0.2.6"
 
 [target.x86_64-apple-darwin.dependencies]
 fsevent = "^0.2.12"
