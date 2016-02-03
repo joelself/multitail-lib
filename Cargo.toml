@@ -1,15 +1,13 @@
 [package]
-name = "multitail"
+name = "mtaillib"
 version = "0.1.0"
 authors = ["Joel Self <joel@dislocal.com>"]
 
 [dependencies]
-term = "^0.4.2"
 notify = "^2.5.4"
-getopts = "^0.2.14"
 
 [target.x86_64-apple-darwin.dependencies]
 fsevent = "^0.2.12"
 
 [[bin]]
-name = "mtail"
+mtaillibtest
