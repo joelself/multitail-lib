@@ -18,11 +18,13 @@ use notify::{RecommendedWatcher, PollWatcher, Error, Watcher, op};
 use self::macros::*;
 #[macro_use]
 mod macros;
+#[cfg(not(target_os = "macos"))] pub type TailWatcher = RecommendedWatcher;
+#[cfg(target_os = "macos")] pub type TailWatcher = PollWatcher;
 
 const TX_BUF_SIZE: usize = 1024usize;
 
 #[no_mangle]
-pub extern "C" fn start_all_talis(array_file_path: *const *const c_char, length: size_t) -> Box<MultiTail> {
+pub extern "C" fn start_all_tails(array_file_path: *const *const c_char, length: size_t) -> Box<MultiTail> {
 	let mut files = vec![];
 	for i in 0..length {
 		let array: &[u8] = unsafe {
@@ -39,7 +41,8 @@ pub fn start_all_tails_internal(files: Vec<String>) -> Box<MultiTail> {
 pub struct MultiTail {
 	handles: RefCell<Vec<JoinHandle<()>>>,
 	files: Vec<String>,
-	global_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
+	global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,
+	receiver: JoinHandle<()>,
 }
 
 struct TailBytes {
@@ -47,19 +50,23 @@ struct TailBytes {
 	bytes: RefCell<Vec<u8>>,
 	last_nl: isize,
 }
+#[repr(C)]
+pub struct Tuple {
+    a: libc::uint32_t,
+    b: libc::uint32_t,
+}
 
 impl MultiTail {
 	pub fn new(files: Vec<String>) -> MultiTail {
 		let (tx, rx) : (Sender<TailBytes>, Receiver<TailBytes>) = mpsc::channel();
 		let mut thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
-		let mut global_buffer: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
-		let receiver = MultiTail{handles: RefCell::new(vec![]), files: files.clone(),
-			global_buffer: global_buffer.clone()};
+		let mut global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>> = Arc::new(Mutex::new(vec![]));
+		let mut handles: RefCell<Vec<JoinHandle<()>>> = RefCell::new(vec![]);
 		let mut thread_num = 0;
 		for filepath in files.iter() {
 			let filepath = filepath.clone();
 			let tx_new = tx.clone();
-			receiver.handles.borrow_mut().push(thread::spawn(move || {
+			handles.borrow_mut().push(thread::spawn(move || {
 				start_tail(thread_num, filepath, tx_new);
 			}));
 			let mut thread_buffers = thread_buffers.lock().unwrap();
@@ -67,14 +74,15 @@ impl MultiTail {
 			thread_num += 1;
 		}
 		let global_buf_ref = global_buffer.clone();
-		thread::spawn(move || {
+		let receiver = thread::spawn(move || {
 			MultiTail::receive_msgs(rx, thread_buffers.clone(), global_buf_ref);
 		});
-		return MultiTail{handles: RefCell::new(vec![]), files: files.clone(), global_buffer: global_buffer.clone()}
+		return MultiTail{handles: RefCell::new(vec![]), files: files.clone(), global_buffer: global_buffer.clone(),
+										 receiver: receiver}
 	}
 
 	fn receive_msgs(rx: Receiver<TailBytes>, thread_buffers: Arc<Mutex<Vec<Vec<u8>>>>,
-									global_buffer: Arc<Mutex<Vec<Vec<u8>>>>,) {
+									global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,) {
 		loop {
 			match rx.recv() {
 				Ok(bytes) => {
@@ -85,10 +93,10 @@ impl MultiTail {
 						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes.borrow()[..bytes.last_nl as usize]);
 						// lock global buffer
 						let mut global_buffer = global_buffer.lock().unwrap();
-						global_buffer.push(thread_buffers.remove(bytes.thread));
 						let mut new_vec: Vec<u8> = vec![];
 						new_vec.extend_from_slice(&bytes.bytes.borrow()[bytes.last_nl as usize..]);
-						thread_buffers.insert(bytes.thread, new_vec);
+						global_buffer.push((bytes.thread, thread_buffers.remove(bytes.thread))); // move the thread buffer to the global buffer
+						thread_buffers.insert(bytes.thread, new_vec); // replace the thread buffer with a new one
 					} else {
 						// got a an unprintable message, append it to the current buffer
 						// lock thread buffers
@@ -99,6 +107,17 @@ impl MultiTail {
 				_ => (),
 			}
 		}
+	}
+
+	pub fn get_received(&self) -> Vec<(usize, String)> {
+		let mut global_buffer = self.global_buffer.lock().unwrap();
+		let mut ret: Vec<(usize, String)> = vec![];
+		ret.reserve(global_buffer.len());
+		for i in 0..global_buffer.len() {
+			let (thread, v) = global_buffer.remove(i);
+			ret.push((thread, String::from_utf8(v).unwrap()));
+		}
+		ret
 	}
 }
 
@@ -161,13 +180,13 @@ fn find_last_nl_slice(buf: &[u8]) -> isize {
 
 struct Channel {
 	join_handle: Option<JoinHandle<()>>,
-	watcher: Option<RecommendedWatcher>,
+	watcher: Option<TailWatcher>,
 	tx: Sender<TailBytes>,
 }
 
 impl Channel {
 	#[cfg(target_os = "macos")]
-	pub fn new(tx: Sender<fsevent::Event>, filepath: String, tx_parent: Sender<TailBytes>)
+	pub fn new(tx: Sender<notify::Event>, filepath: String, tx_parent: Sender<TailBytes>)
 	-> Channel {
 		// let fp = filepath.clone();
 		// let jh: JoinHandle<()> = thread::spawn(move || {
@@ -189,7 +208,7 @@ impl Channel {
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
 	pub fn new(tx: Sender<notify::Event>, filepath: String, tx_parent: Sender<TailBytes>) -> Channel {
-		let mut w: Result<RecommendedWatcher, Error> = RecommendedWatcher::new(tx);
+		let mut w: Result<TailWatcher, Error> = TailWatcher::new(tx);
 		let watcher = match w {
 			Ok(mut watcher) => {
 				watcher.watch(&filepath);
