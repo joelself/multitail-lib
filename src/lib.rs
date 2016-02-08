@@ -5,17 +5,16 @@ extern crate fsevent;
 use std::boxed::Box;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::sync::{Arc, Mutex, mpsc};
-use std::{thread, env, str};
+use std::{thread, str};
 use std::thread::JoinHandle;
 use std::fs;
 use std::fs::File;
 use std::io::SeekFrom;
 use std::io::prelude::*;
-use std::ffi::CStr;
+//use std::ffi::CStr;
 use libc::{c_char, size_t};
 use std::cell::RefCell;
-use notify::{RecommendedWatcher, PollWatcher, Error, Watcher, op};
-use self::macros::*;
+use notify::{PollWatcher, Error, Watcher, op};
 #[macro_use]
 mod macros;
 #[cfg(not(target_os = "macos"))] pub type TailWatcher = RecommendedWatcher;
@@ -26,11 +25,11 @@ const TX_BUF_SIZE: usize = 1024usize;
 #[no_mangle]
 pub extern "C" fn start_all_tails(array_file_path: *const *const c_char, length: size_t) -> Box<MultiTail> {
 	let mut files = vec![];
+	let string_array: &[&[u8]] = unsafe {
+		std::slice::from_raw_parts(array_file_path as *const &[u8], length as usize)
+	};
 	for i in 0..length {
-		let array: &[u8] = unsafe {
-			std::slice::from_raw_parts(array_file_path as *const u8, length as usize)
-		};
-		files.push(str::from_utf8(array).unwrap().to_string());
+		files.push(str::from_utf8(string_array[i]).unwrap().to_string());
 	}
 	start_all_tails_internal(files)
 }
@@ -59,9 +58,9 @@ pub struct Tuple {
 impl MultiTail {
 	pub fn new(files: Vec<String>) -> MultiTail {
 		let (tx, rx) : (Sender<TailBytes>, Receiver<TailBytes>) = mpsc::channel();
-		let mut thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
-		let mut global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>> = Arc::new(Mutex::new(vec![]));
-		let mut handles: RefCell<Vec<JoinHandle<()>>> = RefCell::new(vec![]);
+		let thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+		let global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>> = Arc::new(Mutex::new(vec![]));
+		let handles: RefCell<Vec<JoinHandle<()>>> = RefCell::new(vec![]);
 		let mut thread_num = 0;
 		for filepath in files.iter() {
 			let filepath = filepath.clone();
@@ -132,7 +131,7 @@ fn open_and_seek<'a>(filepath: &str) -> File {
 	let mut bytes: Vec<u8> = vec![];
 	let mut nls = 0;
 	file.seek(SeekFrom::End(-(size as i64))).unwrap();
-	file.read_to_end(&mut bytes);
+	let _unused = file.read_to_end(&mut bytes);
 	for i in 0..bytes.len() - 1 {
 		if bytes[size as usize -1 - i] == 0x0A {
 			nls += 1;
@@ -162,7 +161,6 @@ fn find_last_nl(buf: &Vec<u8>) -> usize {
 }
 
 fn find_last_nl_slice(buf: &[u8]) -> isize {
-	let iter = buf.iter().rev();
 	let len = buf.len();
 	for i in 0..len {
 		if buf[len - 1 - i] == 0x0A {
@@ -198,10 +196,13 @@ impl Channel {
 		// Channel{join_handle: Some(jh), watcher: None}
 		// You can't watch some files (a lot of the files you would want to tail) using FSEvents
 		// So I'm just going to default to the polling watcher on MacOS
-		let mut w: Result<PollWatcher, Error> = PollWatcher::new(tx);
+		let w: Result<PollWatcher, Error> = PollWatcher::new(tx);
 		let watcher = match w {
-			Ok(mut watcher) => Some(watcher),
-			Err(err) 				=> None,
+			Ok(mut watcher) => {
+				let _unused = watcher.watch(&filepath);
+				Some(watcher)
+			}
+			Err(_) 				=> None,
 		};
 		Channel{join_handle: None, watcher: watcher, tx: tx_parent}
 	}
@@ -232,11 +233,9 @@ fn start_tail<'b>(thread: usize, filepath: String, tx_parent: Sender<TailBytes>)
 		match rx.recv() {
 			Ok(event) => {
 				if event.op.unwrap() == op::WRITE {
-					let mut bytes_read: usize = 1;
 					// Read to eof
-					bytes_read = file.read_to_end(& mut buffer).unwrap();
+					let _bytes_read = file.read_to_end(& mut buffer).unwrap();
 					// Get index of last newline
-					let pos = 0;
 					for chunk in buffer.chunks(TX_BUF_SIZE) {
 						let last_nl = find_last_nl_slice(chunk);
 						channel.tx.send(TailBytes{thread: thread, bytes: RefCell::new(chunk.to_vec()), last_nl: last_nl}).unwrap();
