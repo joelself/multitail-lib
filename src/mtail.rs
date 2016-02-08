@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::slice;
+use std::os::unix::fs::MetadataExt;
 //use std::ffi::CStr;
 use libc::{c_char, size_t};
 use std::cell::RefCell;
@@ -88,11 +89,11 @@ impl MultiTail {
 						// got a printable message
 						// lock thread buffers
 						let mut thread_buffers = thread_buffers.lock().unwrap();
-						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes.borrow()[..bytes.last_nl as usize]);
+						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes.borrow()[..(bytes.last_nl+1) as usize]);
 						// lock global buffer
 						let mut global_buffer = global_buffer.lock().unwrap();
 						let mut new_vec: Vec<u8> = vec![];
-						new_vec.extend_from_slice(&bytes.bytes.borrow()[bytes.last_nl as usize..]);
+						new_vec.extend_from_slice(&bytes.bytes.borrow()[(bytes.last_nl + 1) as usize..]);
 						global_buffer.push((bytes.thread, thread_buffers.remove(bytes.thread))); // move the thread buffer to the global buffer
 						thread_buffers.insert(bytes.thread, new_vec); // replace the thread buffer with a new one
 					} else {
@@ -120,7 +121,7 @@ impl MultiTail {
 }
 
 
-fn open_and_seek<'a>(filepath: &str) -> File {
+fn open_and_seek<'a>(filepath: &str) -> (File, u64) {
 	// Output up to the last 2 newlines or 2048 bytes, whichever is less
 	let mut file = File::open(filepath).unwrap();
 	let mut size: u64 = fs::metadata(filepath).unwrap().len();
@@ -129,30 +130,35 @@ fn open_and_seek<'a>(filepath: &str) -> File {
 	}
 	let mut bytes: Vec<u8> = vec![];
 	let mut nls = 0;
-	file.seek(SeekFrom::End(-(size as i64))).unwrap();
-	let _unused = file.read_to_end(&mut bytes);
-	for i in 0..bytes.len() - 1 {
-		if bytes[size as usize -1 - i] == 0x0A {
-			nls += 1;
-			if nls == 2 {
-				// Found the second newline, don't include it in the returned slice
-				return file;
+	println!("file {}: inode: {}", filepath, file.metadata().unwrap().ino());
+	let mut pos = file.seek(SeekFrom::End(-(size as i64))).unwrap();
+	pos += file.read_to_end(&mut bytes).unwrap() as u64;
+	if bytes.len() > 0 {
+		for i in 0..bytes.len() - 1 {
+			if bytes[size as usize -1 - i] == 0x0A {
+				nls += 1;
+				if nls == 2 {
+					// Found the second newline, don't include it in the returned slice
+					return (file, pos);
+				}
 			}
 		}
 	}
 	// Didn't find 2 newlines, just return TX_BUF_SIZE bytes from the end of the file
-	return file;
+	return (file, pos);
 }
 
 fn find_last_nl(buf: &Vec<u8>) -> usize {
 	let iter = buf.iter().rev();
 	let len = buf.len();
-	for i in 0..len {
-		if buf[len - 1 - i] == 0x0A {
-			if i+1 < len && buf[len - 2 - i] == 0x0D {
-				return len - 2 - i;
-			} else {
-				return len - 1 - i;
+	if len > 0 {
+		for i in 0..len {
+			if buf[len - 1 - i] == 0x0A {
+				if i+1 < len && buf[len - 2 - i] == 0x0D {
+					return len  - i;
+				} else {
+					return len - i;
+				}
 			}
 		}
 	}
@@ -161,12 +167,14 @@ fn find_last_nl(buf: &Vec<u8>) -> usize {
 
 fn find_last_nl_slice(buf: &[u8]) -> isize {
 	let len = buf.len();
-	for i in 0..len {
-		if buf[len - 1 - i] == 0x0A {
-			if i+1 < len && buf[len - 2 - i] == 0x0D {
-				return (len - 2 - i) as isize;
-			} else {
-				return (len - 1 - i) as isize;
+	if len > 0 {
+		for i in 0..len {
+			if buf[len - 1 - i] == 0x0A {
+				if i+1 < len && buf[len - 2 - i] == 0x0D {
+					return (len - 1 - i) as isize;
+				} else {
+					return (len - 1 - i) as isize;
+				}
 			}
 		}
 	}
@@ -226,24 +234,49 @@ fn start_tail<'b>(thread: usize, filepath: String, tx_parent: Sender<TailBytes>)
 	// and MacOS 10.10.5, so there's two different config methods for setting up a channel
 	let (tx, rx) = channel();
 	let channel = Channel::new(tx, filepath.clone(), tx_parent);
-	let mut file = open_and_seek(&filepath);
+	let (mut file, mut last_pos) = open_and_seek(&filepath);
+	println!("last_pos: {}", last_pos);
 	loop {
 		buffer.clear();
 		match rx.recv() {
 			Ok(event) => {
+				buffer.clear();
 				if event.op.unwrap() == op::WRITE {
+					println!("file {}: inode: {}", filepath, file.metadata().unwrap().ino());
 					// Read to eof
-					let _bytes_read = file.read_to_end(& mut buffer).unwrap();
-					// Get index of last newline
-					for chunk in buffer.chunks(TX_BUF_SIZE) {
-						let last_nl = find_last_nl_slice(chunk);
-						channel.tx.send(TailBytes{thread: thread, bytes: RefCell::new(chunk.to_vec()), last_nl: last_nl}).unwrap();
+					let mut bytes_read = file.read_to_end(& mut buffer).unwrap();
+					last_pos += bytes_read as u64;
+					if bytes_read == 0 {
+						buffer.clear();
+						file = File::open(filepath.clone()).unwrap();
+						println!("file {}: new inode: {}", filepath, file.metadata().unwrap().ino());
+						last_pos = file.seek(SeekFrom::Start(last_pos - 1)).unwrap();
+						bytes_read = file.read_to_end(& mut buffer).unwrap();
+						if bytes_read > 0 {
+							buffer.pop(); // For some reason when a file changes inodes, read_to_end puts a newline at the end of the buffer
+						}
+						last_pos += bytes_read as u64;
 					}
-					// console.attr(attr);
-					// TODO: actually handle the result
-					// Seek back to just after the last nl
-					let last_nl = find_last_nl(&buffer);
-					file.seek(SeekFrom::Current(last_nl as i64 - buffer.len() as i64 - 1)).unwrap();
+					match String::from_utf8(buffer.clone()) {
+						Ok(s) => {
+							println!("before print bytes");
+							println!("Read: {}, bytes: {}", s, bytes_read);
+							// Get index of last newline
+							for chunk in buffer.chunks(TX_BUF_SIZE) {
+								let last_nl = find_last_nl_slice(chunk);
+								println!("Sending last nl: {} : {} : last char {}", last_nl, String::from_utf8(chunk.to_vec()).unwrap(), chunk.to_vec().pop().unwrap());
+								channel.tx.send(TailBytes{thread: thread, bytes: RefCell::new(chunk.to_vec()), last_nl: last_nl}).unwrap();
+							}
+							// console.attr(attr);
+							// TODO: actually handle the result
+							// Seek back to just after the last nl
+							let last_nl = find_last_nl(&buffer);
+							last_pos = file.seek(SeekFrom::Current(last_nl as i64 - buffer.len() as i64)).unwrap();
+							println!("last_pos: {}", last_pos);
+						},
+						_ => (),
+					}
+
 				}
 			},
 			_ => (),
