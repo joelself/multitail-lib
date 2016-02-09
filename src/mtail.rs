@@ -66,7 +66,7 @@ impl MultiTail {
 			let filepath = filepath.clone();
 			let tx_new = tx.clone();
 			handles.borrow_mut().push(thread::spawn(move || {
-				start_tail(thread_num, filepath, tx_new);
+				let mut chan = Channel::new(thread_num, filepath, tx_new); chan.start_tail();
 			}));
 			let mut thread_buffers = thread_buffers.lock().unwrap();
 			thread_buffers.push(vec![]);
@@ -120,34 +120,6 @@ impl MultiTail {
 	}
 }
 
-
-fn open_and_seek<'a>(filepath: &str) -> (File, u64) {
-	// Output up to the last 2 newlines or 2048 bytes, whichever is less
-	let mut file = File::open(filepath).unwrap();
-	let mut size: u64 = fs::metadata(filepath).unwrap().len();
-	if size > TX_BUF_SIZE as u64 {
-		size = TX_BUF_SIZE as u64;
-	}
-	let mut bytes: Vec<u8> = vec![];
-	let mut nls = 0;
-	println!("file {}: inode: {}", filepath, file.metadata().unwrap().ino());
-	let mut pos = file.seek(SeekFrom::End(-(size as i64))).unwrap();
-	pos += file.read_to_end(&mut bytes).unwrap() as u64;
-	if bytes.len() > 0 {
-		for i in 0..bytes.len() - 1 {
-			if bytes[size as usize -1 - i] == 0x0A {
-				nls += 1;
-				if nls == 2 {
-					// Found the second newline, don't include it in the returned slice
-					return (file, pos);
-				}
-			}
-		}
-	}
-	// Didn't find 2 newlines, just return TX_BUF_SIZE bytes from the end of the file
-	return (file, pos);
-}
-
 fn find_last_nl(buf: &Vec<u8>) -> usize {
 	let iter = buf.iter().rev();
 	let len = buf.len();
@@ -187,11 +159,16 @@ struct Channel {
 	join_handle: Option<JoinHandle<()>>,
 	watcher: Option<TailWatcher>,
 	tx: Sender<TailBytes>,
+	filepath: String,
+	file: File,
+	thread: usize,
+	last_pos: u64,
+	rx: Receiver<notify::Event>,
 }
 
 impl Channel {
 	#[cfg(target_os = "macos")]
-	pub fn new(tx: Sender<notify::Event>, filepath: String, tx_parent: Sender<TailBytes>)
+	pub fn new(thread: usize, filepath: String, tx_parent: Sender<TailBytes>)
 	-> Channel {
 		// let fp = filepath.clone();
 		// let jh: JoinHandle<()> = thread::spawn(move || {
@@ -203,6 +180,7 @@ impl Channel {
 		// Channel{join_handle: Some(jh), watcher: None}
 		// You can't watch some files (a lot of the files you would want to tail) using FSEvents
 		// So I'm just going to default to the polling watcher on MacOS
+		let (tx, rx) = channel();
 		let w: Result<PollWatcher, Error> = PollWatcher::new(tx);
 		let watcher = match w {
 			Ok(mut watcher) => {
@@ -211,11 +189,14 @@ impl Channel {
 			}
 			Err(_) 				=> None,
 		};
-		Channel{join_handle: None, watcher: watcher, tx: tx_parent}
+		let (file, pos) = Channel::open_and_seek(&filepath);
+		Channel{join_handle: None, watcher: watcher, tx: tx_parent, filepath: filepath,
+						file: file, thread: thread, last_pos: pos, rx: rx}
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "windows"))]
-	pub fn new(tx: Sender<notify::Event>, filepath: String, tx_parent: Sender<TailBytes>) -> Channel {
+	pub fn new(thread: usize, filepath: String, tx_parent: Sender<TailBytes>) -> Channel {
+		let (tx, rx) = channel();
 		let mut w: Result<TailWatcher, Error> = TailWatcher::new(tx);
 		let watcher = match w {
 			Ok(mut watcher) => {
@@ -224,62 +205,94 @@ impl Channel {
 			},
 			Err(err) 				=> None,
 		};
-		Channel{join_handle: None, watcher: watcher, tx: tx_parent}
+		Channel{join_handle: None, watcher: watcher, tx: tx_parent, filepath: filepath,
+						file: file, thread: thread, last_pos: pos, rx: rx}
 	}
-}
 
-fn start_tail<'b>(thread: usize, filepath: String, tx_parent: Sender<TailBytes>) {
-	let mut buffer: Vec<u8> = vec![];
-	// Currently the notify library for Rust doesn't work with MacOS X FSEvents on Rust 1.6.0,
-	// and MacOS 10.10.5, so there's two different config methods for setting up a channel
-	let (tx, rx) = channel();
-	let channel = Channel::new(tx, filepath.clone(), tx_parent);
-	let (mut file, mut last_pos) = open_and_seek(&filepath);
-	println!("last_pos: {}", last_pos);
-	loop {
-		buffer.clear();
-		match rx.recv() {
-			Ok(event) => {
-				buffer.clear();
-				if event.op.unwrap() == op::WRITE {
-					println!("file {}: inode: {}", filepath, file.metadata().unwrap().ino());
-					// Read to eof
-					let mut bytes_read = file.read_to_end(& mut buffer).unwrap();
-					last_pos += bytes_read as u64;
-					if bytes_read == 0 {
-						buffer.clear();
-						file = File::open(filepath.clone()).unwrap();
-						println!("file {}: new inode: {}", filepath, file.metadata().unwrap().ino());
-						last_pos = file.seek(SeekFrom::Start(last_pos - 1)).unwrap();
-						bytes_read = file.read_to_end(& mut buffer).unwrap();
-						if bytes_read > 0 {
-							buffer.pop(); // For some reason when a file changes inodes, read_to_end puts a newline at the end of the buffer
-						}
-						last_pos += bytes_read as u64;
+	fn open_and_seek<'a>(filepath: &str) -> (File, u64) {
+		// Output up to the last 2 newlines or 2048 bytes, whichever is less
+		let mut file = File::open(filepath).unwrap();
+		let mut size: u64 = fs::metadata(filepath).unwrap().len();
+		if size > TX_BUF_SIZE as u64 {
+			size = TX_BUF_SIZE as u64;
+		}
+		let mut bytes: Vec<u8> = vec![];
+		let mut nls = 0;
+		println!("file {}: inode: {}", filepath, file.metadata().unwrap().ino());
+		let mut last_pos = file.seek(SeekFrom::End(-(size as i64))).unwrap();
+		last_pos += file.read_to_end(&mut bytes).unwrap() as u64;
+		if bytes.len() > 0 {
+			for i in 0..bytes.len() - 1 {
+				if bytes[size as usize -1 - i] == 0x0A {
+					nls += 1;
+					if nls == 2 {
+						// Found the second newline, don't include it in the returned slice
+						return (file, last_pos);
 					}
-					match String::from_utf8(buffer.clone()) {
-						Ok(s) => {
-							println!("before print bytes");
-							println!("Read: {}, bytes: {}", s, bytes_read);
-							// Get index of last newline
-							for chunk in buffer.chunks(TX_BUF_SIZE) {
-								let last_nl = find_last_nl_slice(chunk);
-								println!("Sending last nl: {} : {} : last char {}", last_nl, String::from_utf8(chunk.to_vec()).unwrap(), chunk.to_vec().pop().unwrap());
-								channel.tx.send(TailBytes{thread: thread, bytes: RefCell::new(chunk.to_vec()), last_nl: last_nl}).unwrap();
-							}
-							// console.attr(attr);
-							// TODO: actually handle the result
-							// Seek back to just after the last nl
-							let last_nl = find_last_nl(&buffer);
-							last_pos = file.seek(SeekFrom::Current(last_nl as i64 - buffer.len() as i64)).unwrap();
-							println!("last_pos: {}", last_pos);
+				}
+			}
+		}
+		return (file, last_pos);// Didn't find 2 newlines, just return TX_BUF_SIZE bytes from the end of the file
+	}
+
+	fn re_read_file(&mut self, buffer: &mut Vec<u8>){
+		buffer.clear();
+		loop {
+			match File::open(self.filepath.clone()) {
+				Ok(f) => {self.file = f; break},
+				Err(_) => (),
+			}
+		}
+		self.last_pos = self.file.seek(SeekFrom::Start(self.last_pos - 1)).unwrap();
+		let bytes_read = self.file.read_to_end(buffer).unwrap();
+		if bytes_read > 0 {
+			buffer.pop(); // For some reason when a file changes inodes, read_to_end puts a newline at the end of the buffer
+		}
+	}
+
+	fn read_next(&mut self, mut buffer: &mut Vec<u8>) {
+		buffer.clear();
+		// Read to eof
+		let bytes_read = self.file.read_to_end(& mut buffer).unwrap();
+		if bytes_read == 0 {
+			self.re_read_file(&mut buffer);
+		}
+	}
+
+	fn send_to_global(&mut self, buffer: &Vec<u8>){
+		// Get index of last newline
+		for chunk in buffer.chunks(TX_BUF_SIZE) {
+			let last_nl = find_last_nl_slice(chunk);
+			self.tx.send(TailBytes{thread: self.thread, bytes: RefCell::new(chunk.to_vec()), last_nl: last_nl}).unwrap();
+		}
+		// TODO: actually handle the result
+		// Seek back to just after the last nl
+		let last_nl = find_last_nl(&buffer);
+		self.last_pos = self.file.seek(SeekFrom::Current(last_nl as i64 - buffer.len() as i64)).unwrap();
+	}
+
+	pub fn start_tail(&mut self) {
+		let mut buffer: Vec<u8> = vec![];
+		// Currently the notify library for Rust doesn't work with MacOS X FSEvents on Rust 1.6.0,
+		// and MacOS 10.10.5, so there's two different config methods for setting up a channel
+		loop {
+			buffer.clear();
+			match self.rx.recv() {
+				Ok(event) => {
+					match event.op {
+						Ok(op) if op == op::WRITE => {
+							self.read_next(&mut buffer);
+							self.send_to_global(&buffer);
 						},
+						Err(Error::PathNotFound) => {
+							self.re_read_file(&mut buffer);
+							self.send_to_global(&buffer);
+						}
 						_ => (),
 					}
-
-				}
-			},
-			_ => (),
+				},
+				_ => (),
+			}
 		}
 	}
 }
