@@ -14,27 +14,81 @@ use std::slice;
 use std::os::unix::fs::MetadataExt;
 //use std::ffi::CStr;
 use libc::{c_char, size_t};
+use std::mem;
 use std::cell::RefCell;
+use std::ffi::{CString, CStr};
 use notify::{PollWatcher, Error, Watcher, op};
 #[cfg(not(target_os = "macos"))] pub type TailWatcher = RecommendedWatcher;
 #[cfg(target_os = "macos")] pub type TailWatcher = PollWatcher;
 
 const TX_BUF_SIZE: usize = 1024usize;
 
-#[no_mangle]
-pub extern "C" fn start_all_tails(array_file_path: *const *const c_char, length: size_t) -> Box<MultiTail> {
-	use std::slice::from_raw_parts;
-	let mut files = vec![];
-	let string_array: &[&[u8]] = unsafe {
-		std::slice::from_raw_parts(array_file_path as *const &[u8], length as usize)
-	};
-	for i in 0..length {
-		files.push(str::from_utf8(string_array[i]).unwrap().to_string());
-	}
-	start_all_tails_internal(files)
+#[repr(C)]
+pub struct Tuple {
+    line: *const StrWrap,
+    thread: libc::size_t
 }
-pub fn start_all_tails_internal(files: Vec<String>) -> Box<MultiTail> {
-	Box::new(MultiTail::new(files))
+
+#[repr(C)]
+pub struct StrWrap {
+		line: *const libc::c_void,
+}
+
+#[repr(C)]
+pub struct TupleArray {
+	lines: *const Tuple,
+	len: libc::size_t,
+}
+
+impl TupleArray {
+    fn from_vec(mut vec: Vec<(usize, String)>) -> TupleArray {
+      // Important to make length and capacity match
+      // A better solution is to track both length and capacity
+      vec.shrink_to_fit();
+      let vec_null = vec![0; vec.len()];
+      let mut vt: Vec<*const Tuple> = vec![];
+      for i in 0..vec.len() {
+      	let (ref t_tmp, ref s_tmp) = vec[i];
+      	let t = t_tmp.clone();
+      	let s = s_tmp.clone();
+      	let s = CString::new(s).unwrap();
+		    let p = s.as_ptr();
+		    mem::forget(s);
+      	let sw = StrWrap{line: p as *mut _};
+      	let t = &Tuple {line: &sw  as * const StrWrap, thread: t as libc::size_t};
+      	vt.push(unsafe{mem::transmute::<&Tuple, *const Tuple>(t)});
+   		}
+      let array = TupleArray { lines: vt.as_ptr() as *const Tuple, len: vec.len() as libc::size_t};
+
+      // Whee! Leak the memory, and now the raw pointer (and
+      // eventually C) is the owner.
+      mem::forget(vec);
+
+      array
+  }
+}
+
+
+#[no_mangle]
+pub extern fn multi_tail_new(array_file_path: *const *const c_char, length: size_t) -> *const libc::c_void {
+  unsafe {
+		let len: usize = length;
+		let mut paths: Vec<String> = vec![];
+		let strings: &[*const c_char] = unsafe { std::slice::from_raw_parts(array_file_path as *const *const c_char, len) };
+		for i in 0..len {
+	    let path: String = CStr::from_ptr(strings[i]).to_string_lossy().into_owned();
+	    paths.push(path);
+	  }
+    let tails = MultiTail::new(paths);
+		let tails: &MultiTail = unsafe {&*(&tails as *const MultiTail)};
+    Box::into_raw(Box::new(tails)) as *mut libc::c_void
+  }
+}
+
+#[no_mangle]
+pub extern fn get_received(m: Box<MultiTail>) -> TupleArray {
+	let res = m.get_received();
+	return TupleArray::from_vec(res);
 }
 
 pub struct MultiTail {
@@ -48,11 +102,6 @@ struct TailBytes {
 	thread: usize,
 	bytes: RefCell<Vec<u8>>,
 	last_nl: isize,
-}
-#[repr(C)]
-pub struct Tuple {
-    a: libc::uint32_t,
-    b: libc::uint32_t,
 }
 
 impl MultiTail {
