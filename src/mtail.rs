@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::SeekFrom;
 use std::io::prelude::*;
 use std::slice;
+use std::ptr;
 use std::os::unix::fs::MetadataExt;
 //use std::ffi::CStr;
 use libc::{c_char, size_t};
@@ -25,13 +26,8 @@ const TX_BUF_SIZE: usize = 1024usize;
 
 #[repr(C)]
 pub struct Tuple {
-    line: *const StrWrap,
+    line: *const libc::c_char,
     thread: libc::size_t
-}
-
-#[repr(C)]
-pub struct StrWrap {
-		line: *const libc::c_void,
 }
 
 #[repr(C)]
@@ -53,16 +49,21 @@ impl TupleArray {
       	let s = s_tmp.clone();
       	let s = CString::new(s).unwrap();
 		    let p = s.as_ptr();
-		    mem::forget(s);
-      	let sw = StrWrap{line: p as *mut _};
-      	let t = &Tuple {line: &sw  as * const StrWrap, thread: t as libc::size_t};
-      	vt.push(unsafe{mem::transmute::<&Tuple, *const Tuple>(t)});
+		    //mem::forget(s);
+      	let t = &Tuple {line: p, thread: t as libc::size_t};
+      	//vt.push(&mut State = unsafe { &mut *(data as *mut State) };)
+      	let tuple_ptr: *const Tuple = t;
+      	vt.push(tuple_ptr)
+      	//vt.push(unsafe{mem::transmute::<&Tuple, *const Tuple>(t)});
    		}
       let array = TupleArray { lines: vt.as_ptr() as *const Tuple, len: vec.len() as libc::size_t};
 
       // Whee! Leak the memory, and now the raw pointer (and
       // eventually C) is the owner.
-      mem::forget(vec);
+			println!("forget vec");
+			// if vec.len() > 0 {
+	  //     mem::forget(vec);
+	  //   }
 
       array
   }
@@ -70,7 +71,7 @@ impl TupleArray {
 
 
 #[no_mangle]
-pub extern fn multi_tail_new(array_file_path: *const *const c_char, length: size_t) -> *const libc::c_void {
+pub extern fn multi_tail_new(array_file_path: *const *const c_char, length: size_t) -> *mut MultiTail {
   unsafe {
 		let len: usize = length;
 		let mut paths: Vec<String> = vec![];
@@ -79,16 +80,24 @@ pub extern fn multi_tail_new(array_file_path: *const *const c_char, length: size
 	    let path: String = CStr::from_ptr(strings[i]).to_string_lossy().into_owned();
 	    paths.push(path);
 	  }
-    let tails = MultiTail::new(paths);
-		let tails: &MultiTail = unsafe {&*(&tails as *const MultiTail)};
-    Box::into_raw(Box::new(tails)) as *mut libc::c_void
+    Box::into_raw(Box::new(MultiTail::new(paths)))
   }
 }
 
 #[no_mangle]
-pub extern fn get_received(m: Box<MultiTail>) -> TupleArray {
-	let res = m.get_received();
-	return TupleArray::from_vec(res);
+pub extern fn get_received(ptr: *mut MultiTail) -> TupleArray {
+	if ptr.is_null() { return TupleArray{ lines: ptr::null(), len: 0 } }
+	println!("Before from_raw");
+	let mtail = unsafe {
+    assert!(!ptr.is_null());
+    &mut *ptr
+  };
+	println!("Before get_received");
+	let res = mtail.get_received();
+	println!("Before from_vec");
+	let ta = TupleArray::from_vec(res);
+	println!("Before return");
+	return ta;
 }
 
 pub struct MultiTail {
@@ -115,6 +124,7 @@ impl MultiTail {
 			let filepath = filepath.clone();
 			let tx_new = tx.clone();
 			handles.borrow_mut().push(thread::spawn(move || {
+				println!("Starting thread for: {}", filepath);
 				let mut chan = Channel::new(thread_num, filepath, tx_new); chan.start_tail();
 			}));
 			let mut thread_buffers = thread_buffers.lock().unwrap();

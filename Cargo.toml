@@ -12,3 +12,7 @@ fsevent = "^0.2.12"
 
 [[bin]]
 name = "mtail"
+
+[lib]
+name = "mtaillib"
+crate-type = ["dylib"]
