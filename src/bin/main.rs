@@ -3,12 +3,12 @@ use mtaillib::mtail::MultiTail;
 use std::io::{self, Write};
 
 fn main() {
-	let m = MultiTail::new(vec!["/Users/joel.self/Projects/joel/test.log".to_string(),
+	let mut m = MultiTail::new(vec!["/Users/joel.self/Projects/joel/test.log".to_string(),
 												 "/Users/joel.self/Projects/joel/test2.log".to_string()]);
 	loop {
-		let msgs = m.get_received();
+		let msgs = m.wait_for_lines();
 		for (thread, s) in msgs {
-			print!("{}:\t{}", thread, s);
+			print!("File {} => {}", thread, String::from_utf8(s).unwrap());
 			io::stdout().flush().unwrap();
 		}
 	}

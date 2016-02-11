@@ -32,38 +32,38 @@ pub struct Tuple {
 
 #[repr(C)]
 pub struct TupleArray {
-	lines: *const Tuple,
+	lines: *const libc::c_void,
 	len: libc::size_t,
 }
 
 impl TupleArray {
-    fn from_vec(mut vec: Vec<(usize, String)>) -> TupleArray {
+    fn from_vec(mut vec: Vec<(usize, Vec<u8>)>) -> TupleArray {
       // Important to make length and capacity match
       // A better solution is to track both length and capacity
-      vec.shrink_to_fit();
       let vec_null = vec![0; vec.len()];
-      let mut vt: Vec<*const Tuple> = vec![];
+      let mut vt: Vec<Tuple> = vec![];
       for i in 0..vec.len() {
       	let (ref t_tmp, ref s_tmp) = vec[i];
       	let t = t_tmp.clone();
       	let s = s_tmp.clone();
       	let s = CString::new(s).unwrap();
-		    let p = s.as_ptr();
+		    let p: *const c_char = s.as_ptr();
+		    mem::forget(s);
 		    //mem::forget(s);
-      	let t = &Tuple {line: p, thread: t as libc::size_t};
+      	let t = Tuple {line: p, thread: t as libc::size_t};
       	//vt.push(&mut State = unsafe { &mut *(data as *mut State) };)
-      	let tuple_ptr: *const Tuple = t;
-      	vt.push(tuple_ptr)
+      	let tuple: Tuple = t;
+      	vt.push(tuple)
       	//vt.push(unsafe{mem::transmute::<&Tuple, *const Tuple>(t)});
    		}
-      let array = TupleArray { lines: vt.as_ptr() as *const Tuple, len: vec.len() as libc::size_t};
+   		vt.shrink_to_fit();
+      let array = TupleArray { lines: vt.as_ptr() as *const libc::c_void, len: vec.len() as libc::size_t};
 
       // Whee! Leak the memory, and now the raw pointer (and
       // eventually C) is the owner.
-			println!("forget vec");
-			// if vec.len() > 0 {
-	  //     mem::forget(vec);
-	  //   }
+			if vt.len() > 0 {
+	      mem::forget(vt);
+	    }
 
       array
   }
@@ -85,26 +85,27 @@ pub extern fn multi_tail_new(array_file_path: *const *const c_char, length: size
 }
 
 #[no_mangle]
-pub extern fn get_received(ptr: *mut MultiTail) -> TupleArray {
+pub extern fn wait_for_lines(ptr: *mut MultiTail) -> TupleArray {
 	if ptr.is_null() { return TupleArray{ lines: ptr::null(), len: 0 } }
-	println!("Before from_raw");
 	let mtail = unsafe {
     assert!(!ptr.is_null());
     &mut *ptr
   };
-	println!("Before get_received");
-	let res = mtail.get_received();
-	println!("Before from_vec");
-	let ta = TupleArray::from_vec(res);
-	println!("Before return");
-	return ta;
+	let mut buffer = mtail.wait_for_lines();
+	let mut ret: Vec<(usize, Vec<u8>)> = vec![];
+	ret.reserve(buffer.len());
+	while buffer.len() > 0 {
+		let (thread, v) = buffer.remove(0);
+		ret.push((thread, v));
+	}
+	return TupleArray::from_vec(ret);
 }
 
 pub struct MultiTail {
 	handles: RefCell<Vec<JoinHandle<()>>>,
 	files: Vec<String>,
-	global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,
-	receiver: JoinHandle<()>,
+	thread_buffers: Vec<Vec<u8>>,
+	rx: Receiver<TailBytes>,
 }
 
 struct TailBytes {
@@ -116,66 +117,47 @@ struct TailBytes {
 impl MultiTail {
 	pub fn new(files: Vec<String>) -> MultiTail {
 		let (tx, rx) : (Sender<TailBytes>, Receiver<TailBytes>) = mpsc::channel();
-		let thread_buffers: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
-		let global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>> = Arc::new(Mutex::new(vec![]));
+		let mut thread_buffers: Vec<Vec<u8>> = vec![];
 		let handles: RefCell<Vec<JoinHandle<()>>> = RefCell::new(vec![]);
 		let mut thread_num = 0;
 		for filepath in files.iter() {
 			let filepath = filepath.clone();
 			let tx_new = tx.clone();
 			handles.borrow_mut().push(thread::spawn(move || {
-				println!("Starting thread for: {}", filepath);
+				println!("Starting tail for: {}", filepath);
 				let mut chan = Channel::new(thread_num, filepath, tx_new); chan.start_tail();
 			}));
-			let mut thread_buffers = thread_buffers.lock().unwrap();
 			thread_buffers.push(vec![]);
 			thread_num += 1;
 		}
-		let global_buf_ref = global_buffer.clone();
-		let receiver = thread::spawn(move || {
-			MultiTail::receive_msgs(rx, thread_buffers.clone(), global_buf_ref);
-		});
-		return MultiTail{handles: RefCell::new(vec![]), files: files.clone(), global_buffer: global_buffer.clone(),
-										 receiver: receiver}
+		return MultiTail{handles: RefCell::new(vec![]), files: files.clone(),
+										 thread_buffers: thread_buffers, rx: rx}
 	}
 
-	fn receive_msgs(rx: Receiver<TailBytes>, thread_buffers: Arc<Mutex<Vec<Vec<u8>>>>,
-									global_buffer: Arc<Mutex<Vec<(usize, Vec<u8>)>>>,) {
+	pub fn wait_for_lines(&mut self) -> Vec<(usize, Vec<u8>)> {
+		let mut global_buffer: Vec<(usize, Vec<u8>)> = vec![];
 		loop {
-			match rx.recv() {
+			match self.rx.recv() {
 				Ok(bytes) => {
 					if bytes.last_nl >= 0 {
 						// got a printable message
-						// lock thread buffers
-						let mut thread_buffers = thread_buffers.lock().unwrap();
-						thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes.borrow()[..(bytes.last_nl+1) as usize]);
-						// lock global buffer
-						let mut global_buffer = global_buffer.lock().unwrap();
+						self.thread_buffers[bytes.thread].extend_from_slice(&bytes.bytes.borrow()[..(bytes.last_nl+1) as usize]);
 						let mut new_vec: Vec<u8> = vec![];
 						new_vec.extend_from_slice(&bytes.bytes.borrow()[(bytes.last_nl + 1) as usize..]);
-						global_buffer.push((bytes.thread, thread_buffers.remove(bytes.thread))); // move the thread buffer to the global buffer
-						thread_buffers.insert(bytes.thread, new_vec); // replace the thread buffer with a new one
+						global_buffer.push((bytes.thread, self.thread_buffers.remove(bytes.thread))); // move the thread buffer to the global buffer
+						self.thread_buffers.insert(bytes.thread, new_vec); // replace the thread buffer with a new one
 					} else {
 						// got a an unprintable message, append it to the current buffer
-						// lock thread buffers
-						let mut thread_buffers = thread_buffers.lock().unwrap();
-						thread_buffers[bytes.thread].append(& mut *bytes.bytes.borrow_mut());
+						self.thread_buffers[bytes.thread].append(& mut *bytes.bytes.borrow_mut());
 					}
 				},
 				_ => (),
 			}
+			if global_buffer.len() > 0 {
+				break;
+			}
 		}
-	}
-
-	pub fn get_received(&self) -> Vec<(usize, String)> {
-		let mut global_buffer = self.global_buffer.lock().unwrap();
-		let mut ret: Vec<(usize, String)> = vec![];
-		ret.reserve(global_buffer.len());
-		for i in 0..global_buffer.len() {
-			let (thread, v) = global_buffer.remove(i);
-			ret.push((thread, String::from_utf8(v).unwrap()));
-		}
-		ret
+		return global_buffer;
 	}
 }
 
@@ -277,7 +259,6 @@ impl Channel {
 		}
 		let mut bytes: Vec<u8> = vec![];
 		let mut nls = 0;
-		println!("file {}: inode: {}", filepath, file.metadata().unwrap().ino());
 		let mut last_pos = file.seek(SeekFrom::End(-(size as i64))).unwrap();
 		last_pos += file.read_to_end(&mut bytes).unwrap() as u64;
 		if bytes.len() > 0 {
